@@ -78,7 +78,6 @@ class MemoryMLP(Module):
                 x = F.gelu(x)
 
             x = x @ weight
-
         return x
 
 # memory mlp, but with gated residual + final projection
@@ -246,3 +245,154 @@ class MemoryAttention(Module):
         ff_out = h @ ffw2
 
         return attn_out + ff_out
+
+def selective_scan_ref(u, delta, A, B, C, D=None, z=None):
+    if u.dim() == 3:
+        batch_size, seq_len, d_inner = u.shape
+    else:
+        seq_len = 1
+        batch_size, d_inner = u.shape
+    dt_rank = delta.shape[-1]
+    d_state = A.shape[-1]
+
+    delta_expanded = delta.unsqueeze(2)  # (B, L, 1, dt_rank)
+
+    if delta_expanded.dim() - A.dim() == 2:
+        deltaA = torch.exp(delta_expanded * A.unsqueeze(0).unsqueeze(0))  # (B, L, d_inner, d_state)
+    else:
+        deltaA = torch.exp(delta_expanded * A.unsqueeze(1))
+    deltaB = delta.unsqueeze(2) * B.unsqueeze(2)  # (B, L, d_inner, dt_rank)
+
+    h = torch.zeros(batch_size, d_inner, d_state, device=u.device, dtype=u.dtype)
+    ys = []
+    
+    for i in range(seq_len):
+        h = deltaA[:, i] * h + deltaB[:, i] * u[:, i].unsqueeze(-1)
+        y = (h @ C[:, i].unsqueeze(-1)).squeeze(-1)
+        ys.append(y)
+    
+    y = torch.stack(ys, dim=1)
+    
+    if D is not None:
+        y = y + u * D
+    if z is not None:
+        y = y * F.silu(z)
+        
+    return y
+
+class MambaBlock(Module):
+    def __init__(
+        self,
+        dim,
+        dt_rank="auto",
+        d_state=16,
+        d_conv=4,
+        expansion_factor=2.0
+    ):
+        super().__init__()
+        self.dim = dim
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.dt_rank = dt_rank if dt_rank != "auto" else max(16, dim // 16)
+        
+        d_inner = int(dim * expansion_factor)
+        self.d_inner = d_inner
+        
+        self.weights = ParameterList([
+            Parameter(torch.randn(dim, d_inner * 2)),      # x_proj (input projection)
+            Parameter(torch.randn(d_inner, 1, d_conv)),       # conv1d weight  
+            Parameter(torch.randn(d_inner)),             # conv1d bias
+            Parameter(torch.randn(d_inner, self.dt_rank)), # dt_proj
+            Parameter(torch.randn(d_inner, d_state)),      # A_log 
+            Parameter(torch.randn(d_inner, self.dt_rank)), # B_proj
+            Parameter(torch.randn(d_inner, self.dt_rank)), # C_proj  
+            Parameter(torch.randn(d_inner)),               # D (skip connection)
+            Parameter(torch.randn(d_inner, dim)),          # out_proj
+            Parameter(torch.randn(self.dt_rank)),          # dt_proj_bias
+        ])
+
+        for i, weight in enumerate(self.weights):
+            if i == 4:
+                A_log = torch.log(torch.arange(1, d_state + 1, dtype=torch.float32).repeat(d_inner, 1))
+                self.weights[i].data = -A_log
+            elif i == 7:
+                nn.init.ones_(weight)
+            elif i == 9:
+                nn.init.constant_(weight, 1.0)
+    
+    def chunked_conv1d(self, x_proj_out, conv_weight, conv_bias, chunk_size=256):
+        B, L, D = x_proj_out.shape
+        _, _, _, kernel_size = conv_weight.shape
+        
+        outputs = []
+        
+        for i in range(0, B, chunk_size):
+            end_idx = min(i + chunk_size, B)
+            chunk_size_actual = end_idx - i
+            
+            x_conv_chunk = F.conv1d(
+                x_proj_out[i:end_idx].transpose(1, 2),
+                conv_weight[i:end_idx].reshape(-1, 1, kernel_size),
+                bias=conv_bias[i:end_idx].reshape(-1),
+                padding=self.d_conv - 1,
+                groups=self.d_inner
+            )
+            
+            outputs.append(x_conv_chunk)
+        
+        x_conv = torch.cat(outputs, dim=0)
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return x_conv
+
+    def forward(self, x):
+        (x_proj, conv_weight, conv_bias, dt_proj, A_log, 
+         B_proj, C_proj, D, out_proj, dt_proj_bias) = self.weights
+        
+        is_need_squeeze = False
+        if x.dim() < 3:
+            is_need_squeeze = True
+            x = x.unsqueeze(-2)
+
+        x_z = x @ x_proj  # (B, L, 2*d_inner)
+        x_proj_out, z = x_z.chunk(2, dim=-1)  # Each (B, L, d_inner)
+
+        if conv_weight.dim() == 3:
+            x_conv = F.conv1d(
+                x_proj_out.transpose(1, 2),
+                conv_weight,        # (d_inner, 1, d_conv)
+                bias=conv_bias,     # (d_inner,)
+                padding=self.d_conv - 1,
+                groups=128
+            )
+        else:
+            x_conv = self.chunked_conv1d(x_proj_out, conv_weight, conv_bias, chunk_size=conv_weight.shape[0] // 4)
+        
+        x_conv = F.silu(x_proj_out)
+
+        x_proj = x_conv @ dt_proj
+        
+        if dt_proj_bias.dim() == 2:
+            dt = F.softplus(x_proj + dt_proj_bias.unsqueeze(1))
+        else:
+            dt = F.softplus(x_proj + dt_proj_bias)
+        B = x_conv @ B_proj
+        C = x_conv @ C_proj
+        
+        A = -A_log.exp()
+        
+        if D.dim() == 2:
+            y = selective_scan_ref(x_conv, dt, A, B, C, D.unsqueeze(1), z)
+        else:
+            y = selective_scan_ref(x_conv, dt, A, B, C, D, z)
+        
+        # Output projection
+        output = y @ out_proj
+
+        if is_need_squeeze:
+            output = output.squeeze()
+        return output
+    
+class HRMMemoryBlock:
+    pass

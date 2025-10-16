@@ -13,20 +13,23 @@ from adam_atan2_pytorch import AdoptAtan2
 from titans_pytorch import (
     MemoryAsContextTransformer,
     MemoryMLP,
-    MemoryAttention
+    MemoryAttention,
+    HRMMemoryBlock,
+    MambaBlock
 )
 
 from transformers import AutoTokenizer
 from datasets import load_dataset
-PATH = '/home/sirius3085/exps/titans/attn_mem'
+
+PATH = '/home/sirius3085/exps/titans/mamba_'
 
 # constants
 
 NUM_BATCHES = int(1e5)
 BATCH_SIZE = 4
 GRADIENT_ACCUMULATE_EVERY = 4
-LEARNING_RATE = 2e-4
-VALIDATE_EVERY  = 100
+LEARNING_RATE = 5e-5
+VALIDATE_EVERY  = 50
 GENERATE_EVERY  = 500
 PRIME_LENGTH = 100
 GENERATE_LENGTH = 512
@@ -44,7 +47,7 @@ NEURAL_MEM_MOMENTUM = True
 NEURAL_MEM_MOMENTUM_ORDER = 1
 NEURAL_MEM_QK_NORM = True
 NEURAL_MEM_MAX_LR = 1e-1
-USE_MEM_ATTENTION_MODEL = True
+USE_MEM_ATTENTION_MODEL = False
 WINDOW_SIZE = 32
 NEURAL_MEM_SEGMENT_LEN = 4                      # set smaller for more granularity for learning rate / momentum etc
 NEURAL_MEM_BATCH_SIZE = 128                     # set smaller to update the neural memory weights more often as it traverses the sequence
@@ -55,10 +58,12 @@ NEURAL_MEM_WEIGHT_RESIDUAL = True               # learning to accept contributio
 NEURAL_MEM_QKV_RECEIVES_DIFF_VIEW = True        # will allow the neural memory to select what layers from which to derive queries / keys / values, effectively allowing it to graft itself to the transformer in any way to be beneficial. this is to address an issue from a phd student who noted that the mem network is learning nothing more than wk @ wv. this also generalizes all possible ways to connect the neural memory to a transformer, a sort of NAS
 NEURAL_MEM_SPEC_NORM_SURPRISES = True           # applying lessons from Muon optimizer to surprise updates, by spectral norming the surprises
 
+USE_MEM_HRM_MODEL = True
+
 # experiment related
 
 PROJECT_NAME = 'titans-mac-transformer'
-RUN_NAME = f'mac - {NUM_LONGTERM_MEM} longterm mems with attn mem, layers {NEURAL_MEM_LAYERS}'
+RUN_NAME = f'mac - {NUM_LONGTERM_MEM} longterm mems with mamba block, layers {NEURAL_MEM_LAYERS}'
 WANDB_ONLINE = False # turn this on to pipe experiment to cloud
 
 # perf related
@@ -87,12 +92,15 @@ def decode_token(token):
 def decode_tokens(tokens):
     return ''.join(list(map(decode_token, tokens)))
 
-torch.cuda.set_device(1)
-
+torch.cuda.set_device(4)
 # memory model
 
 if USE_MEM_ATTENTION_MODEL:
     neural_memory_model = MemoryAttention(
+        dim = 64
+    )
+elif USE_MEM_HRM_MODEL:
+        neural_memory_model = MambaBlock(
         dim = 64
     )
 else:
@@ -139,70 +147,6 @@ model = MemoryAsContextTransformer(
     )
 ).cuda()
 
-'''
-# prepare enwik8 data
-
-with gzip.open('./data/enwik8.gz') as file:
-    data = np.frombuffer(file.read(int(95e6)), dtype = np.uint8).copy()
-    data_train, data_val = np.split(data, [int(90e6)])
-    data_train, data_val = map(torch.from_numpy, (data_train, data_val))
-
-class TextSamplerDataset(Dataset):
-    def __init__(self, data, seq_len):
-        super().__init__()
-        self.data = data
-        self.seq_len = seq_len
-
-    def __getitem__(self, index):
-        rand_start = torch.randint(0, self.data.size(0) - self.seq_len, (1,))
-        full_seq = self.data[rand_start: rand_start + self.seq_len + 1].long()
-        return full_seq.cuda()
-
-    def __len__(self):
-        return self.data.size(0) // self.seq_len
-
-train_dataset = TextSamplerDataset(data_train, SEQ_LEN)
-val_dataset   = TextSamplerDataset(data_val, SEQ_LEN)
-train_loader  = cycle(DataLoader(train_dataset, batch_size = BATCH_SIZE))
-val_loader    = cycle(DataLoader(val_dataset, batch_size = BATCH_SIZE))
-
-# optimizer
-
-optim = AdoptAtan2(model.parameters(), lr = LEARNING_RATE)
-
-# training
-
-for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10., desc = 'training'):
-    model.train()
-
-    for __ in range(GRADIENT_ACCUMULATE_EVERY):
-        loss = model(next(train_loader), return_loss = True)
-        loss.backward()
-
-    print(f'training loss: {loss.item()}')
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-    optim.step()
-    optim.zero_grad()
-    wandb.log(dict(loss = loss.item()))
-
-    if i % VALIDATE_EVERY == 0:
-        model.eval()
-        with torch.no_grad():
-            loss = model(next(val_loader), return_loss = True)
-            print(f'validation loss: {loss.item()}')
-            torch.save(model.state_dict(), PATH + '/' + f'{i}_iter.pt')
-
-    if SHOULD_GENERATE and i % GENERATE_EVERY == 0:
-        model.eval()
-        inp = random.choice(val_dataset)[:PRIME_LENGTH]
-        prime = decode_tokens(inp)
-        print(f'%s \n\n %s', (prime, '*' * 100))
-
-        sample = model.sample(inp[None, ...], GENERATE_LENGTH, use_cache = USE_FAST_INFERENCE)
-        output_str = decode_tokens(sample[0])
-        print(output_str)
-'''
-
 print("model -- got it!")
 print(f"Model has {sum(p.numel() for p in model.parameters())} parameters")
 # prepare fineweb data
@@ -242,18 +186,22 @@ optim = AdoptAtan2(model.parameters(), lr = LEARNING_RATE)
 
 # training
 
-wandb.watch(model, log="all", log_freq=100)
+#wandb.watch(model, log="all", log_freq=100)
 
 best_val_loss = np.inf
 
+model.train()
 for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10., desc = 'training'):
-    model.train()
-
     train_loss = 0
     for __ in range(GRADIENT_ACCUMULATE_EVERY):
-        loss = model(next(train_loader), return_loss = True)
+        tl = next(train_loader)
+        #if i == 1:
+        #    print(tokenizer.decode(tl))
+        loss = model(tl, return_loss = True)
         loss.backward()
         train_loss += loss.item()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     train_loss /= GRADIENT_ACCUMULATE_EVERY
 
     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.3)
@@ -281,13 +229,13 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10., desc = 'training'):
             best_val_loss = val_loss
             torch.save(model.state_dict(), PATH + "/mac_fw_mem3_best")
 
-    if SHOULD_GENERATE and i % GENERATE_EVERY == 0:
-        val_loader = FinewebLoader(fw_val, tokenizer, batch_size=BATCH_SIZE)
-        model.eval()
-        inp = next(iter(val_loader))[0, :PRIME_LENGTH]
-        prime = tokenizer.decode(inp)
-        print(f'%s \n\n %s', (prime, '*' * 100))
+    #if SHOULD_GENERATE and i % GENERATE_EVERY == 0:
+    #    val_loader = FinewebLoader(fw_val, tokenizer, batch_size=BATCH_SIZE)
+    #    model.eval()
+    #    inp = next(iter(val_loader))[0, :PRIME_LENGTH]
+    #    prime = tokenizer.decode(inp)
+    #    print(f'%s \n\n %s', (prime, '*' * 100))
 
-        sample = model.sample(inp[None, ...], GENERATE_LENGTH, use_cache = USE_FAST_INFERENCE)
-        output_str = tokenizer.decode(sample[0])
-        print(output_str)
+    #    sample = model.sample(inp[None, ...], GENERATE_LENGTH, use_cache = USE_FAST_INFERENCE)
+    #    output_str = tokenizer.decode(sample[0])
+    #    print(output_str)

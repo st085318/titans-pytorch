@@ -9,7 +9,9 @@ from titans_pytorch.memory_models import (
     MemoryAttention,
     FactorizedMemoryMLP,
     MemorySwiGluMLP,
-    GatedResidualMemoryMLP
+    GatedResidualMemoryMLP,
+    HRMMemoryBlock,
+    MambaBlock
 )
 
 from titans_pytorch.mac_transformer import (
